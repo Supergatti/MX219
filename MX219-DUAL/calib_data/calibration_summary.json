@@ -1,0 +1,20 @@
+{
+  "pairs_found": 20,
+  "pairs_used": 20,
+  "image_size": {
+    "width": 1280,
+    "height": 720
+  },
+  "board": {
+    "type": "ChArUco",
+    "dictionary": "DICT_4X4_50",
+    "squares_x": 9,
+    "squares_y": 6,
+    "square_length": 0.025,
+    "marker_length": 0.018
+  },
+  "reproj_error_left": 0.4471476090164664,
+  "reproj_error_right": 0.2875547342974487,
+  "reproj_error_stereo": 53.85244945253322,
+  "output": "calib_data/stereo_calib.npz"
+}
