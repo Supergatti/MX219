@@ -281,6 +281,10 @@ class StereoPipeline:
         while self._running:
             t0 = time.monotonic()
 
+            if self._cap0 is None or self._cap1 is None:
+                time.sleep(0.01)
+                continue
+
             ok0, frame0 = self._cap0.read()
             ok1, frame1 = self._cap1.read()
             if not ok0 or not ok1:
@@ -445,7 +449,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                 return self._mjpeg(channel)
         self.send_error(HTTPStatus.NOT_FOUND)
 
-    def log_message(self, *_):
+    def log_message(self, format: str, *args):
         pass
 
     def _html(self, body: bytes):
