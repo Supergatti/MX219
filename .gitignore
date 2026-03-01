@@ -1,26 +1,4 @@
-# Python bytecode (compiled files)
-__pycache__/
-*.py[cod]
-
-# Virtual environments
-venv/
-env/
-.env
-
-# Large model weights or data
-*.onnx
-*.pth
-*.weights
-*.bin
-*.mp4
-*.jpg
+**/__pycache__/
+*.pyc
+MX219-DUAL/calib_data/images/
 *.png
-
-# System files
-.DS_Store
-Thumbs.db
-
-# Jetson/C++ build files
-build/
-devel/
-*.so
