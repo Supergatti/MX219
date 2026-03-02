@@ -1,0 +1,25 @@
+{
+  "pairs_total": 40,
+  "pairs_detected": 40,
+  "pairs_rejected": 0,
+  "pairs_used": 40,
+  "image_size": {
+    "width": 1280,
+    "height": 720
+  },
+  "board": {
+    "type": "chessboard",
+    "cols": 8,
+    "rows": 5,
+    "square_mm": 23.8
+  },
+  "focal_left_px": 1110.493766910292,
+  "focal_right_px": 1116.6292037326045,
+  "baseline_m": 0.057063128940064475,
+  "baseline_mm": 57.06312894006447,
+  "reproj_error_left": 0.20487720250028757,
+  "reproj_error_right": 0.1817670429439513,
+  "reproj_error_stereo": 0.9671795863406338,
+  "quality": "good",
+  "output": "calib_data/stereo_calib.npz"
+}
