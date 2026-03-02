@@ -49,4 +49,7 @@ docker run -it --rm \
   -v "${SCRIPT_DIR}:/workspace/src" \
   -w /workspace/src \
   "${IMAGE}" \
-  -c "source /opt/ros/humble/setup.bash && exec bash"
+  -c "source /opt/ros/humble/setup.bash && \
+      echo '[INFO] Starting VSLAM launch...' && \
+      ros2 launch /workspace/src/isaac_vslam_run.launch.py || \
+      (echo '[ERROR] Launch failed, dropping to bash for debug'; exec bash)"
