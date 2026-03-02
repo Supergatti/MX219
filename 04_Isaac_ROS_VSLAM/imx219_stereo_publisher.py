@@ -56,7 +56,7 @@ class Imx219StereoPublisher(Node):
             f'nvarguscamerasrc sensor-id={sensor_id} ! '
             f'video/x-raw(memory:NVMM), width={self.width}, height={self.height}, '
             f'format=(string)NV12, framerate=(fraction){self.fps}/1 ! '
-            'nvvidconv flip-method=0 ! '
+            'nvvidconv flip-method=2 ! '
             'video/x-raw, format=(string)BGRx ! '
             'videoconvert ! '
             'video/x-raw, format=(string)BGR ! '

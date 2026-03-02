@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Web 监控节点：订阅 ROS2 话题，通过浏览器实时查看双目画面和 SLAM 位姿。
+Web 监控节点：订阅 ROS2 话题，通过浏览器实时查看：
+  - 纠正方向后的双目画面
+  - 双目视差图（深度可视化，TURBO 伪彩色：暖色=近，冷色=远）
+  - ORB 特征点叠加（SLAM 候选追踪点可视化）
+  - SLAM 位姿数值
+
 访问：http://<Jetson-IP>:8080
 """
-import io
+import json
 import os
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -18,26 +23,82 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
-
 # --------------------------------------------------------------------------- #
 #  全局状态（ROS 线程写，HTTP 线程读）
 # --------------------------------------------------------------------------- #
 _lock = threading.Lock()
 _state = {
-    'left_jpg': None,
-    'right_jpg': None,
+    'left_jpg':      None,   # 纠正方向后的原图 JPEG bytes
+    'right_jpg':     None,
+    'disparity_jpg': None,   # StereoSGBM 视差图 JPEG bytes
+    'features_jpg':  None,   # ORB 特征点叠加 JPEG bytes
+    'left_raw':      None,   # numpy BGR，供后处理用
+    'right_raw':     None,
     'pose': {'x': 0.0, 'y': 0.0, 'z': 0.0,
              'qx': 0.0, 'qy': 0.0, 'qz': 0.0, 'qw': 1.0},
-    'tracking': 'WAITING',
+    'tracking':    'WAITING',
     'frame_count': 0,
 }
 
 WEB_PORT = int(os.environ.get('WEB_MONITOR_PORT', '8080'))
 
+# StereoSGBM 参数（适合 1280×720，降采样 0.5× 加速）
+_MIN_DISP   =  0
+_NUM_DISP   = 96   # 必须是 16 的倍数
+_BLOCK_SIZE =  5
+_stereo = cv2.StereoSGBM_create(
+    minDisparity=_MIN_DISP,
+    numDisparities=_NUM_DISP,
+    blockSize=_BLOCK_SIZE,
+    P1=8  * 3 * _BLOCK_SIZE ** 2,
+    P2=32 * 3 * _BLOCK_SIZE ** 2,
+    disp12MaxDiff=1,
+    preFilterCap=63,
+    uniquenessRatio=10,
+    speckleWindowSize=100,
+    speckleRange=32,
+    mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+)
 
-def _encode_jpg(frame: np.ndarray, quality: int = 70) -> bytes:
+# ORB 检测器（快速，适合嵌入式实时）
+_orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8, edgeThreshold=10)
+
+
+def _encode_jpg(frame: np.ndarray, quality: int = 75) -> bytes:
     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes()
+
+
+def _compute_disparity(left: np.ndarray, right: np.ndarray) -> Optional[np.ndarray]:
+    """计算 StereoSGBM 视差图并返回 TURBO 伪彩色 BGR 图，失败返回 None。"""
+    try:
+        scale = 0.5
+        lh = cv2.resize(cv2.cvtColor(left,  cv2.COLOR_BGR2GRAY), None, fx=scale, fy=scale)
+        rh = cv2.resize(cv2.cvtColor(right, cv2.COLOR_BGR2GRAY), None, fx=scale, fy=scale)
+        disp = _stereo.compute(lh, rh).astype(np.float32) / 16.0
+        vis  = np.zeros_like(disp, dtype=np.uint8)
+        valid = disp > _MIN_DISP
+        if valid.any():
+            d_min, d_max = disp[valid].min(), disp[valid].max()
+            if d_max > d_min:
+                vis[valid] = ((disp[valid] - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+        colored = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+        return cv2.resize(colored, (left.shape[1], left.shape[0]))
+    except Exception:
+        return None
+
+
+def _compute_features(left: np.ndarray) -> np.ndarray:
+    """在左目画面上叠加 ORB 特征点，返回带标注的 BGR 图。"""
+    gray = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+    kps  = _orb.detect(gray, None)
+    out  = left.copy()
+    cv2.drawKeypoints(out, kps, out,
+                      color=(0, 255, 0),
+                      flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    cv2.putText(out, f'ORB features: {len(kps)}', (10, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -49,104 +110,133 @@ class WebMonitorNode(Node):
         self.bridge = CvBridge()
 
         self.create_subscription(Image, '/left/image_rect',
-                                 lambda msg: self._on_image(msg, 'left_jpg'), 5)
+                                 lambda msg: self._on_image(msg, 'left'), 5)
         self.create_subscription(Image, '/right/image_rect',
-                                 lambda msg: self._on_image(msg, 'right_jpg'), 5)
+                                 lambda msg: self._on_image(msg, 'right'), 5)
+        self.create_subscription(Odometry, '/visual_slam/tracking/odometry',
+                                 self._on_odom, 5)
+        self.create_subscription(PoseStamped, '/visual_slam/tracking/slam_pose',
+                                 self._on_pose_stamped, 5)
 
-        # Isaac ROS VSLAM 输出话题（兼容两种可能的名字）
-        self.create_subscription(
-            Odometry, '/visual_slam/tracking/odometry',
-            self._on_odom, 5)
-        self.create_subscription(
-            PoseStamped, '/visual_slam/tracking/slam_pose',
-            self._on_pose_stamped, 5)
+        self.get_logger().info(f'Web monitor → http://0.0.0.0:{WEB_PORT}')
 
-        self.get_logger().info(
-            f'Web monitor started → http://0.0.0.0:{WEB_PORT}')
-
-    def _on_image(self, msg: Image, key: str) -> None:
+    def _on_image(self, msg: Image, side: str) -> None:
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            jpg = _encode_jpg(frame)
+            jpg   = _encode_jpg(frame)
             with _lock:
-                _state[key] = jpg
+                _state[f'{side}_jpg'] = jpg
+                _state[f'{side}_raw'] = frame
                 _state['frame_count'] += 1
+                left  = _state['left_raw']
+                right = _state['right_raw']
+
+            # 后处理（在锁外运行，避免阻塞 ROS 回调）
+            if left is not None and right is not None:
+                disp_bgr = _compute_disparity(left, right)
+                feat_bgr = _compute_features(left)
+                with _lock:
+                    if disp_bgr is not None:
+                        _state['disparity_jpg'] = _encode_jpg(disp_bgr)
+                    _state['features_jpg'] = _encode_jpg(feat_bgr)
         except Exception as e:
-            self.get_logger().warning(f'Image convert error: {e}')
+            self.get_logger().warning(f'Image error: {e}')
 
     def _on_odom(self, msg: Odometry) -> None:
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
         with _lock:
-            _state['pose'] = {'x': p.x, 'y': p.y, 'z': p.z,
-                              'qx': q.x, 'qy': q.y, 'qz': q.z, 'qw': q.w}
+            _state['pose']     = {'x': p.x, 'y': p.y, 'z': p.z,
+                                  'qx': q.x, 'qy': q.y, 'qz': q.z, 'qw': q.w}
             _state['tracking'] = 'TRACKING'
 
     def _on_pose_stamped(self, msg: PoseStamped) -> None:
-        p = msg.pose.position
-        q = msg.pose.orientation
+        p, q = msg.pose.position, msg.pose.orientation
         with _lock:
-            _state['pose'] = {'x': p.x, 'y': p.y, 'z': p.z,
-                              'qx': q.x, 'qy': q.y, 'qz': q.z, 'qw': q.w}
+            _state['pose']     = {'x': p.x, 'y': p.y, 'z': p.z,
+                                  'qx': q.x, 'qy': q.y, 'qz': q.z, 'qw': q.w}
             _state['tracking'] = 'TRACKING'
 
 
 # --------------------------------------------------------------------------- #
-#  HTTP 请求处理
+#  HTTP 服务
 # --------------------------------------------------------------------------- #
-_PLACEHOLDER = _encode_jpg(
-    np.zeros((240, 320, 3), dtype=np.uint8))
+_PLACEHOLDER = _encode_jpg(np.zeros((360, 640, 3), dtype=np.uint8))
 
-_HTML = """<!DOCTYPE html>
+_HTML = b"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>IMX219 VSLAM Monitor</title>
   <style>
-    body {{ background:#111; color:#eee; font-family:monospace; margin:0; padding:16px; }}
-    h2 {{ color:#0cf; margin:0 0 12px; }}
-    .grid {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    img {{ border:2px solid #333; max-width:100%; }}
-    #pose {{ background:#1a1a2e; border:1px solid #0cf; padding:12px 20px;
-             margin:12px 0; border-radius:6px; font-size:14px; line-height:1.8; }}
-    .label {{ color:#0cf; }}
-    .ok {{ color:#0f0; }} .warn {{ color:#f80; }} .err {{ color:#f44; }}
+    *    { box-sizing:border-box; margin:0; padding:0; }
+    body { background:#0d0d0d; color:#ddd; font-family:monospace; padding:12px; }
+    h2   { color:#00ccff; margin-bottom:10px; font-size:18px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .cell { background:#1a1a1a; border:1px solid #333; border-radius:6px; padding:8px; }
+    .ct   { color:#00ccff; font-size:12px; margin-bottom:6px; }
+    img   { width:100%; border-radius:4px; display:block; }
+    #pose-bar {
+      background:#111827; border:1px solid #00ccff; border-radius:6px;
+      padding:10px 16px; margin-bottom:10px;
+      display:flex; gap:24px; align-items:center; flex-wrap:wrap; font-size:13px;
+    }
+    .ok   { color:#00ff88 } .warn { color:#ffaa00 } .err { color:#ff4444 }
+    .val  { color:#fff; font-weight:bold }
+    .lbl  { color:#888; font-size:11px }
   </style>
   <script>
-    function refresh() {{
-      document.getElementById('left').src='/stream/left?t='+Date.now();
-      document.getElementById('right').src='/stream/right?t='+Date.now();
-      fetch('/api/pose').then(r=>r.json()).then(d=>{{
-        let cls = d.tracking==='TRACKING'?'ok':(d.tracking==='WAITING'?'warn':'err');
-        document.getElementById('pose').innerHTML =
-          '<span class="label">状态：</span><span class="'+cls+'">'+d.tracking+'</span><br>'+
-          '<span class="label">位置：</span>'+
-          'X='+d.pose.x.toFixed(3)+'m  '+
-          'Y='+d.pose.y.toFixed(3)+'m  '+
-          'Z='+d.pose.z.toFixed(3)+'m<br>'+
-          '<span class="label">帧计数：</span>'+d.frame_count;
-      }});
-    }}
+    function refresh() {
+      var t = Date.now();
+      ['left','right','disparity','features'].forEach(function(s) {
+        document.getElementById('img_'+s).src = '/stream/'+s+'?t='+t;
+      });
+      fetch('/api/pose').then(function(r){return r.json();}).then(function(d){
+        var cls = d.tracking==='TRACKING'?'ok':(d.tracking==='WAITING'?'warn':'err');
+        document.getElementById('status').className = cls;
+        document.getElementById('status').textContent = d.tracking;
+        document.getElementById('px').textContent = d.pose.x.toFixed(3);
+        document.getElementById('py').textContent = d.pose.y.toFixed(3);
+        document.getElementById('pz').textContent = d.pose.z.toFixed(3);
+        document.getElementById('fc').textContent = d.frame_count;
+      });
+    }
     setInterval(refresh, 200);
     window.onload = refresh;
   </script>
 </head>
 <body>
   <h2>IMX219 双目 VSLAM 实时监控</h2>
-  <div id="pose">等待 SLAM 数据...</div>
+  <div id="pose-bar">
+    <div><div class="lbl">SLAM 状态</div><span id="status" class="warn">WAITING</span></div>
+    <div><div class="lbl">X (m)</div><span class="val" id="px">—</span></div>
+    <div><div class="lbl">Y (m)</div><span class="val" id="py">—</span></div>
+    <div><div class="lbl">Z (m)</div><span class="val" id="pz">—</span></div>
+    <div><div class="lbl">帧计数</div><span class="val" id="fc">0</span></div>
+  </div>
   <div class="grid">
-    <div><div style="color:#0cf">左目 /left/image_rect</div>
-      <img id="left" width="640" height="360"></div>
-    <div><div style="color:#0cf">右目 /right/image_rect</div>
-      <img id="right" width="640" height="360"></div>
+    <div class="cell">
+      <div class="ct">左目原图 /left/image_rect</div>
+      <img id="img_left" alt="left">
+    </div>
+    <div class="cell">
+      <div class="ct">右目原图 /right/image_rect</div>
+      <img id="img_right" alt="right">
+    </div>
+    <div class="cell">
+      <div class="ct">双目视差图（TURBO 伪彩色：暖色=近，冷色=远）</div>
+      <img id="img_disparity" alt="disparity">
+    </div>
+    <div class="cell">
+      <div class="ct">ORB 特征点（绿色圆圈 = SLAM 候选追踪点）</div>
+      <img id="img_features" alt="features">
+    </div>
   </div>
 </body>
 </html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass  # 静默 HTTP 日志
+    def log_message(self, *args): pass
 
     def _send(self, code: int, ct: str, data: bytes) -> None:
         self.send_response(code)
@@ -157,29 +247,27 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == '/' or self.path.startswith('/?'):
-            self._send(200, 'text/html; charset=utf-8', _HTML.encode())
-
-        elif self.path.startswith('/stream/left'):
-            with _lock:
-                jpg = _state['left_jpg'] or _PLACEHOLDER
+        path = self.path.split('?')[0]
+        if path == '/':
+            self._send(200, 'text/html; charset=utf-8', _HTML)
+        elif path == '/stream/left':
+            with _lock: jpg = _state['left_jpg'] or _PLACEHOLDER
             self._send(200, 'image/jpeg', jpg)
-
-        elif self.path.startswith('/stream/right'):
-            with _lock:
-                jpg = _state['right_jpg'] or _PLACEHOLDER
+        elif path == '/stream/right':
+            with _lock: jpg = _state['right_jpg'] or _PLACEHOLDER
             self._send(200, 'image/jpeg', jpg)
-
-        elif self.path.startswith('/api/pose'):
-            import json
+        elif path == '/stream/disparity':
+            with _lock: jpg = _state['disparity_jpg'] or _PLACEHOLDER
+            self._send(200, 'image/jpeg', jpg)
+        elif path == '/stream/features':
+            with _lock: jpg = _state['features_jpg'] or _PLACEHOLDER
+            self._send(200, 'image/jpeg', jpg)
+        elif path == '/api/pose':
             with _lock:
-                data = {
-                    'tracking': _state['tracking'],
-                    'pose': _state['pose'],
-                    'frame_count': _state['frame_count'],
-                }
-            self._send(200, 'application/json',
-                       json.dumps(data).encode())
+                data = {'tracking':    _state['tracking'],
+                        'pose':        _state['pose'],
+                        'frame_count': _state['frame_count']}
+            self._send(200, 'application/json', json.dumps(data).encode())
         else:
             self._send(404, 'text/plain', b'Not Found')
 
@@ -187,23 +275,18 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 #  入口
 # --------------------------------------------------------------------------- #
-def _run_http() -> None:
-    server = HTTPServer(('0.0.0.0', WEB_PORT), Handler)
-    server.serve_forever()
-
-
 def main() -> None:
     rclpy.init()
-    node = WebMonitorNode()
-
-    t = threading.Thread(target=_run_http, daemon=True)
+    node   = WebMonitorNode()
+    server = HTTPServer(('0.0.0.0', WEB_PORT), Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-
     try:
         rclpy.spin(node)
     finally:
         node.destroy_node()
         rclpy.shutdown()
+        server.shutdown()
 
 
 if __name__ == '__main__':
