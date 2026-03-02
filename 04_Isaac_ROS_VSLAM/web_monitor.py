@@ -10,6 +10,7 @@ Web 监控节点：订阅 ROS2 话题，通过浏览器实时查看：
 """
 import json
 import os
+import queue
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
@@ -42,26 +43,17 @@ _state = {
 
 WEB_PORT = int(os.environ.get('WEB_MONITOR_PORT', '8080'))
 
-# StereoSGBM 参数（适合 1280×720，降采样 0.5× 加速）
+# StereoBM — 比 SGBM 快 5-10x，适合嵌入式实时
 _MIN_DISP   =  0
-_NUM_DISP   = 96   # 必须是 16 的倍数
-_BLOCK_SIZE =  5
-_stereo = cv2.StereoSGBM_create(
-    minDisparity=_MIN_DISP,
-    numDisparities=_NUM_DISP,
-    blockSize=_BLOCK_SIZE,
-    P1=8  * 3 * _BLOCK_SIZE ** 2,
-    P2=32 * 3 * _BLOCK_SIZE ** 2,
-    disp12MaxDiff=1,
-    preFilterCap=63,
-    uniquenessRatio=10,
-    speckleWindowSize=100,
-    speckleRange=32,
-    mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
-)
+_NUM_DISP   = 64   # 必须是 16 的倍数
+_BLOCK_SIZE = 15   # StereoBM 需要奇数且 >=5
+_stereo = cv2.StereoBM_create(numDisparities=_NUM_DISP, blockSize=_BLOCK_SIZE)
 
-# ORB 检测器（快速，适合嵌入式实时）
-_orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8, edgeThreshold=10)
+# ORB 检测器（减少特征点数以加快速度）
+_orb = cv2.ORB_create(nfeatures=200, scaleFactor=1.2, nlevels=6, edgeThreshold=10)
+
+# 后处理任务队列：maxsize=1 保证只保留最新一帧，旧帧自动丢弃
+_proc_queue: queue.Queue = queue.Queue(maxsize=1)
 
 
 def _encode_jpg(frame: np.ndarray, quality: int = 75) -> bytes:
@@ -70,7 +62,7 @@ def _encode_jpg(frame: np.ndarray, quality: int = 75) -> bytes:
 
 
 def _compute_disparity(left: np.ndarray, right: np.ndarray) -> Optional[np.ndarray]:
-    """计算 StereoSGBM 视差图并返回 TURBO 伪彩色 BGR 图，失败返回 None。"""
+    """StereoBM 视差图 → TURBO 伪彩色 BGR，降采样 0.5x 加速。"""
     try:
         scale = 0.5
         lh = cv2.resize(cv2.cvtColor(left,  cv2.COLOR_BGR2GRAY), None, fx=scale, fy=scale)
@@ -89,7 +81,7 @@ def _compute_disparity(left: np.ndarray, right: np.ndarray) -> Optional[np.ndarr
 
 
 def _compute_features(left: np.ndarray) -> np.ndarray:
-    """在左目画面上叠加 ORB 特征点，返回带标注的 BGR 图。"""
+    """ORB 特征点叠加，返回带标注的 BGR 图。"""
     gray = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
     kps  = _orb.detect(gray, None)
     out  = left.copy()
@@ -99,6 +91,21 @@ def _compute_features(left: np.ndarray) -> np.ndarray:
     cv2.putText(out, f'ORB features: {len(kps)}', (10, 32),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
     return out
+
+
+def _proc_worker() -> None:
+    """独立线程：从队列取最新帧对，做重计算，绝不阻塞 ROS 回调。"""
+    while True:
+        left, right = _proc_queue.get()  # 阻塞等待新帧
+        try:
+            disp_bgr = _compute_disparity(left, right)
+            feat_bgr = _compute_features(left)
+            with _lock:
+                if disp_bgr is not None:
+                    _state['disparity_jpg'] = _encode_jpg(disp_bgr)
+                _state['features_jpg'] = _encode_jpg(feat_bgr)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -118,9 +125,13 @@ class WebMonitorNode(Node):
         self.create_subscription(PoseStamped, '/visual_slam/tracking/slam_pose',
                                  self._on_pose_stamped, 5)
 
+        # 启动后处理工作线程（守护线程，随主进程退出）
+        t = threading.Thread(target=_proc_worker, daemon=True)
+        t.start()
         self.get_logger().info(f'Web monitor → http://0.0.0.0:{WEB_PORT}')
 
     def _on_image(self, msg: Image, side: str) -> None:
+        """ROS 回调：只做图像解码和 JPEG 编码，立即返回，绝不做重计算。"""
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             jpg   = _encode_jpg(frame)
@@ -131,14 +142,12 @@ class WebMonitorNode(Node):
                 left  = _state['left_raw']
                 right = _state['right_raw']
 
-            # 后处理（在锁外运行，避免阻塞 ROS 回调）
+            # 把最新帧对投入队列（非阻塞，满了就丢弃旧帧）
             if left is not None and right is not None:
-                disp_bgr = _compute_disparity(left, right)
-                feat_bgr = _compute_features(left)
-                with _lock:
-                    if disp_bgr is not None:
-                        _state['disparity_jpg'] = _encode_jpg(disp_bgr)
-                    _state['features_jpg'] = _encode_jpg(feat_bgr)
+                try:
+                    _proc_queue.put_nowait((left.copy(), right.copy()))
+                except queue.Full:
+                    pass  # 工作线程还在处理上一帧，直接丢弃，不堵塞
         except Exception as e:
             self.get_logger().warning(f'Image error: {e}')
 
