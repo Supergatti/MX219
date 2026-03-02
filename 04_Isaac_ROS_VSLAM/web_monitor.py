@@ -162,7 +162,7 @@ class WebMonitorNode(Node):
 # --------------------------------------------------------------------------- #
 _PLACEHOLDER = _encode_jpg(np.zeros((360, 640, 3), dtype=np.uint8))
 
-_HTML = b"""<!DOCTYPE html>
+_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -249,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split('?')[0]
         if path == '/':
-            self._send(200, 'text/html; charset=utf-8', _HTML)
+            self._send(200, 'text/html; charset=utf-8', _HTML.encode('utf-8'))
         elif path == '/stream/left':
             with _lock: jpg = _state['left_jpg'] or _PLACEHOLDER
             self._send(200, 'image/jpeg', jpg)
