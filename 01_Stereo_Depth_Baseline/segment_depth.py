@@ -203,13 +203,14 @@ ROTATE_CODE = {
 }
 
 def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int) -> str:
+    # 强制 180 度旋转 (flip-method=2)
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        "nvvidconv ! video/x-raw, format=(string)BGRx ! "
-        "videoconvert ! video/x-raw, format=(string)BGR ! "
-        "appsink drop=1 max-buffers=1 sync=false"
+        f"nvvidconv flip-method=2 ! video/x-raw, format=(string)BGRx ! "
+        f"videoconvert ! video/x-raw, format=(string)BGR ! "
+        f"appsink drop=1 max-buffers=1 sync=false"
     )
 
 # ---------------------------------------------------------------------------
@@ -295,8 +296,7 @@ def camera_worker(
             ok0, f0 = cap_l.read(); ok1, f1 = cap_r.read()
             if not ok0 or not ok1: continue
             
-            # 🔥 彻底修复方向：180 度旋转
-            f0 = cv2.rotate(f0, cv2.ROTATE_180); f1 = cv2.rotate(f1, cv2.ROTATE_180)
+            # GStreamer 已经通过 flip-method=2 完成了旋转
 
             # 畸变校正
             if do_rectify and map1x is not None and map1y is not None and map2x is not None and map2y is not None:

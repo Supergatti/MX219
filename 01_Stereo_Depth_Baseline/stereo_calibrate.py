@@ -58,8 +58,11 @@ class Config:
     fps: int = 30
     # 根据用户描述：面对z轴，y轴指向地面(Down)，x轴水平向左(Left)。
     # 物理倒置 + X向左 = 垂直翻转 (Vertical Flip)
-    flip_method: int = 0           # 0=垂直翻转 (满足用户 Y下X左 需求)
-    swap_lr: bool = True           # cam1=左, cam0=右
+    # 我们已经在 pipeline 中强制 flip-method=2 (180度旋转)
+    flip_method: int = 2
+    # 旋转180度后，物理右(Cam0)变为画面左，物理左(Cam1)变为画面右
+    # 所以 Cam0=Left, Cam1=Right，不需要交换
+    swap_lr: bool = False
     # 标定板
     board_type: str = "chessboard"     # "chessboard" 或 "charuco"
     board_cols: int = 8                # 棋盘格列数 / ChArUco squaresX
@@ -84,18 +87,14 @@ class Config:
 # GStreamer / 相机
 # ═══════════════════════════════════════════════════════════════
 def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int) -> str:
+    # 强制 180 度旋转 (flip-method=2)
     return (
-        f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true "
-        f"exposuretimerange='50000000 50000000' "
-        f"gainrange='8 8' "
-        f"wbmode=0 "
-        f"tnr-mode=0 "
-        f"ee-mode=0 ! "
+        f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        "nvvidconv ! video/x-raw, format=(string)BGRx ! "
-        "videoconvert ! video/x-raw, format=(string)BGR ! "
-        "appsink drop=1 max-buffers=1 sync=false"
+        f"nvvidconv flip-method=2 ! video/x-raw, format=(string)BGRx ! "
+        f"videoconvert ! video/x-raw, format=(string)BGR ! "
+        f"appsink drop=1 max-buffers=1 sync=false"
     )
 
 

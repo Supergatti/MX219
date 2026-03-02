@@ -1,3 +1,4 @@
+# 📌 请查阅项目根目录下的 ai_memo.md，获取摄像头摆放和远程使用等重要AI备忘信息。
 # ORB-SLAM3 Pipeline for IMX219 Dual Camera (Jetson Orin Nano)
 
 ## Prerequisites and Installation

@@ -1,3 +1,4 @@
+# 📌 请查阅项目根目录下的 ai_memo.md，获取摄像头摆放和远程使用等重要AI备忘信息。
 # NVIDIA Isaac ROS VSLAM for IMX219 Dual
 
 ## Prerequisites

@@ -324,38 +324,37 @@ def camera_worker(
 ):
     _proc_title("seg-camera-debug")
     print("[CamW] 进程启动 [调试模式]", flush=True)
-    cap_l = cap_r = None
+    cap0 = cap1 = None
     shm_buf = None
 
     try:
         shm_buf = ShmFrameBuffer(shm_name, frame_shape, n_images=2, create=False)
 
         # 核心逻辑修正：
-        # 1. 用户反馈：遮住物理右侧，rawleft被遮。说明 cam0 是物理右。
-        # 2. 摄像头倒装，需要旋转 180 度。
-        # 3. 180 度旋转会交换左右。为了让旋转后的左图(f0)对应场景左侧，
+        # 1. 用户反馈：摄像头倒装，需要旋转 180 度 (flip-method=2)
+        # 2. 180 度旋转会交换左右。为了让旋转后的左图(f0)对应场景左侧，
         #    我们需要把物理右(cam0)分配给 f0，旋转后它就变成了场景左。
         def get_pipe(sid, w, h, f):
-            return (f"nvarguscamerasrc sensor-id={sid} ! video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
-                    f"format=(string)NV12, framerate=(fraction){f}/1 ! nvvidconv ! video/x-raw, format=(string)BGRx ! "
-                    "videoconvert ! video/x-raw, format=(string)BGR ! appsink drop=1 max-buffers=1")
+            return (
+                f"nvarguscamerasrc sensor-id={sid} bufapi-version=1 ! "
+                f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
+                f"format=(string)NV12, framerate=(fraction){f}/1 ! "
+                f"nvvidconv flip-method=2 ! "  # 硬件旋转 180 度
+                f"video/x-raw, format=(string)BGRx ! "
+                f"videoconvert ! "
+                f"video/x-raw, format=(string)BGR ! "
+                f"appsink drop=1 max-buffers=1"
+            )
 
-        profiles = [(cfg.width, cfg.height, cfg.fps), (1280, 720, 30)]
-        opened = False
-        for pw, ph, pf in profiles:
-            cap_l = cv2.VideoCapture(get_pipe(cfg.cam0, pw, ph, pf), cv2.CAP_GSTREAMER)
-            cap_r = cv2.VideoCapture(get_pipe(cfg.cam1, pw, ph, pf), cv2.CAP_GSTREAMER)
-            if cap_l.isOpened() and cap_r.isOpened():
-                opened = True; break
-            if cap_l: cap_l.release()
-            if cap_r: cap_r.release()
+        # 尝试打开摄像头 (双目同步)
+        cap0 = cv2.VideoCapture(get_pipe(cfg.cam0, cfg.width, cfg.height, cfg.fps), cv2.CAP_GSTREAMER)
+        cap1 = cv2.VideoCapture(get_pipe(cfg.cam1, cfg.width, cfg.height, cfg.fps), cv2.CAP_GSTREAMER)
 
         while not stop_event.is_set():
-            ok0, f0 = cap_l.read(); ok1, f1 = cap_r.read()
+            ok0, f0 = cap0.read(); ok1, f1 = cap1.read()
             if not ok0 or not ok1: continue
             
-            # 🔥 彻底修复方向：180 度旋转
-            f0 = cv2.rotate(f0, cv2.ROTATE_180); f1 = cv2.rotate(f1, cv2.ROTATE_180)
+            # GStreamer 已经通过 flip-method=2 完成了旋转
 
             if calib_maps:
                 f0 = cv2.remap(f0, calib_maps["map1x"], calib_maps["map1y"], cv2.INTER_LINEAR)
@@ -367,8 +366,8 @@ def camera_worker(
             frame_ready.set()
     except Exception as e: print(f"[CamW] Error: {e}")
     finally:
-        if cap_l: cap_l.release()
-        if cap_r: cap_r.release()
+        if cap0: cap0.release()
+        if cap1: cap1.release()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
