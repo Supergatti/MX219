@@ -10,7 +10,7 @@ app = Flask(__name__)
 global_frame = None
 frame_lock = threading.Lock()
 
-def get_gst_pipeline(sensor_id=0, width=640, height=480, fps=30):
+def get_gst_pipeline(sensor_id=0, width=640, height=480, fps=30, flip_method=2):
     """
     Generate GStreamer pipeline for IMX219 on Jetson.
     Using rotate=2 (180 deg) as per user instructions.
@@ -18,7 +18,7 @@ def get_gst_pipeline(sensor_id=0, width=640, height=480, fps=30):
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=1 ! "
         f"video/x-raw(memory:NVMM), width={width}, height={height}, format=NV12, framerate={fps}/1 ! "
-        f"nvvidconv flip-method=2 ! "
+        f"nvvidconv flip-method={flip_method} ! "
         f"video/x-raw, format=BGRx ! "
         f"videoconvert ! "
         f"video/x-raw, format=BGR ! appsink drop=True max-buffers=1"
@@ -60,13 +60,15 @@ def main():
     width = 640
     height = 480
     fps = 30  # 尝试恢复到 30fps
+    flip_method = 2
+    swap_lr = True
 
     # 初始化 ORB 特征提取器 (演示用)
     orb = cv2.ORB_create(nfeatures=1000)
 
     print("Opening Cameras...")
     # 尝试打开第一个摄像头
-    cap0 = cv2.VideoCapture(get_gst_pipeline(0, width, height, fps), cv2.CAP_GSTREAMER)
+    cap0 = cv2.VideoCapture(get_gst_pipeline(0, width, height, fps, flip_method), cv2.CAP_GSTREAMER)
     
     if cap0.isOpened():
         print("Camera 0 (Left) opened successfully.")
@@ -77,7 +79,7 @@ def main():
     time.sleep(2.0)  # 稍微缩短等待时间
 
     # 尝试打开第二个摄像头
-    cap1 = cv2.VideoCapture(get_gst_pipeline(1, width, height, fps), cv2.CAP_GSTREAMER)
+    cap1 = cv2.VideoCapture(get_gst_pipeline(1, width, height, fps, flip_method), cv2.CAP_GSTREAMER)
 
     if cap1.isOpened():
         print("Camera 1 (Right) opened successfully.")
@@ -134,6 +136,9 @@ def main():
                 print("Error: No frames captured.")
                 time.sleep(0.1)
                 continue
+
+            if swap_lr and frame_l is not None and frame_r is not None:
+                frame_l, frame_r = frame_r, frame_l
 
             # 处理左图 (ORB 特征演示)
             if frame_l is not None:

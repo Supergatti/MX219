@@ -22,9 +22,10 @@ CAM1 = 1
 WIDTH = 1280
 HEIGHT = 720
 FPS = 30
-ROTATE0 = 180
-ROTATE1 = 180
+ROTATE0 = 0
+ROTATE1 = 0
 SWAP_LR = True
+FLIP_METHOD = 2
 
 SQUARES_X = 9
 SQUARES_Y = 6
@@ -43,24 +44,28 @@ class CaptureConfig:
     width: int
     height: int
     fps: int
+    flip_method: int
     rotate0: int
     rotate1: int
     swap_lr: bool
 
 
-def build_argus_pipeline(sensor_id: int, width: int, height: int, fps: int) -> str:
+def build_argus_pipeline(sensor_id: int, width: int, height: int, fps: int, flip_method: int) -> str:
+    fm = int(flip_method)
+    if fm not in (0, 1, 2, 3, 4, 5, 6, 7):
+        fm = 2
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){width}, height=(int){height}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        "nvvidconv ! video/x-raw, format=(string)BGRx ! "
+        f"nvvidconv flip-method={fm} ! video/x-raw, format=(string)BGRx ! "
         "videoconvert ! video/x-raw, format=(string)BGR ! "
         "appsink drop=1 max-buffers=1 sync=false"
     )
 
 
-def open_camera(sensor_id: int, width: int, height: int, fps: int) -> cv2.VideoCapture:
-    pipeline = build_argus_pipeline(sensor_id, width, height, fps)
+def open_camera(sensor_id: int, width: int, height: int, fps: int, flip_method: int) -> cv2.VideoCapture:
+    pipeline = build_argus_pipeline(sensor_id, width, height, fps, flip_method)
     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
         raise RuntimeError(f"无法打开相机: sensor-id={sensor_id}, pipeline={pipeline}")
@@ -73,6 +78,7 @@ def open_stereo_cameras_with_fallback(
     width: int,
     height: int,
     fps: int,
+    flip_method: int,
 ) -> Tuple[cv2.VideoCapture, cv2.VideoCapture, Tuple[int, int, int]]:
     profiles = [
         (width, height, fps),
@@ -88,9 +94,9 @@ def open_stereo_cameras_with_fallback(
         cap1 = None
         try:
             print(f"[INFO] 成对尝试双目 argus: {w}x{h}@{f}")
-            cap0 = open_camera(cam0, w, h, f)
+            cap0 = open_camera(cam0, w, h, f, flip_method)
             time.sleep(0.25)
-            cap1 = open_camera(cam1, w, h, f)
+            cap1 = open_camera(cam1, w, h, f, flip_method)
 
             ensure_camera_stream_ready(cap0, f"cam0({cam0})")
             ensure_camera_stream_ready(cap1, f"cam1({cam1})")
@@ -186,7 +192,7 @@ def capture_pairs(
     detector_params = cv2.aruco.DetectorParameters()
 
     cap0, cap1, used_profile = open_stereo_cameras_with_fallback(
-        config.cam0, config.cam1, config.width, config.height, config.fps
+        config.cam0, config.cam1, config.width, config.height, config.fps, config.flip_method
     )
 
     try:
@@ -204,7 +210,7 @@ def capture_pairs(
     count = 0
     print("[INFO] 按键: s 保存一对图像(需左右都检测到 ChArUco 角点), q 退出")
     print(f"[INFO] 当前采集配置: {used_profile[0]}x{used_profile[1]}@{used_profile[2]}")
-    print(f"[INFO] 当前旋转配置: rotate0={config.rotate0}, rotate1={config.rotate1}")
+    print(f"[INFO] 当前旋转配置: flip_method={config.flip_method}, rotate0={config.rotate0}, rotate1={config.rotate1}")
     print(f"[INFO] 当前左右互换: swap_lr={config.swap_lr}")
     print(f"[INFO] 目标采集数量: {required_pairs}")
 
@@ -535,6 +541,7 @@ def main() -> int:
             width=WIDTH,
             height=HEIGHT,
             fps=FPS,
+            flip_method=FLIP_METHOD,
             rotate0=ROTATE0,
             rotate1=ROTATE1,
             swap_lr=SWAP_LR,

@@ -77,9 +77,8 @@ class AppConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
-    rotate0: int = 0
-    rotate1: int = 0
-    swap_lr: bool = False
+    flip_method: int = 2
+    swap_lr: bool = True
     calib_path: str = str(Path(__file__).resolve().parent / "calib_data" / "stereo_calib.npz")
     no_rectify: bool = False
     max_disparity: int = 64
@@ -90,7 +89,7 @@ class AppConfig:
     seg_size: int = 256
     max_det: int = 20
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 8088
     jpeg_quality: int = 70
     preview_width: int = 480
     force_pt: bool = False  # 🔥 强制使用PyTorch模型，避免TensorRT不兼容
@@ -202,12 +201,15 @@ ROTATE_CODE = {
     270: cv2.ROTATE_90_COUNTERCLOCKWISE,
 }
 
-def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int) -> str:
+def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int, flip_method: int) -> str:
+    fm = int(flip_method)
+    if fm not in (0, 1, 2, 3, 4, 5, 6, 7):
+        fm = 2
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        "nvvidconv ! video/x-raw, format=(string)BGRx ! "
+        f"nvvidconv flip-method={fm} ! video/x-raw, format=(string)BGRx ! "
         "videoconvert ! video/x-raw, format=(string)BGR ! "
         "appsink drop=1 max-buffers=1 sync=false"
     )
@@ -254,6 +256,42 @@ DEPTH_SCHEMES = {
     4: "直接视差 depth=disp/10 (测试)",
     5: "平方根修正 depth=bf/sqrt(disp)",
 }
+
+def postprocess_disparity(
+    disp: np.ndarray,
+    gray_ref: np.ndarray,
+    min_disp: float = 1.0,
+    texture_grad_thresh: float = 8.0,
+    min_speckle_area: int = 80,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    对视差做轻量后处理，返回:
+      1) 过滤后的视差
+      2) 可靠性掩码 (True 表示可用于测距)
+    """
+    # 1) 中值滤波压制椒盐噪声
+    disp_pp = cv2.medianBlur(disp.astype(np.float32), 5)
+
+    # 2) 纹理约束：弱纹理区域匹配不稳定
+    gx = cv2.Sobel(gray_ref, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_ref, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(gx, gy)
+    texture_mask = grad_mag > texture_grad_thresh
+
+    reliable = (disp_pp > min_disp) & texture_mask
+
+    # 3) Speckle 连通域剔除：去掉孤立小块误匹配
+    cc_mask = reliable.astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cc_mask, connectivity=8)
+    if n_labels > 1:
+        keep = np.zeros_like(reliable, dtype=bool)
+        for i in range(1, n_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= min_speckle_area:
+                keep[labels == i] = True
+        reliable = keep
+
+    disp_pp[~reliable] = 0.0
+    return disp_pp, reliable
 
 def compute_depth(disp: np.ndarray, bf: float, max_disp: float, scheme: int, scale_factor: float = 1.0) -> np.ndarray:
     """
@@ -330,31 +368,21 @@ def camera_worker(
     try:
         shm_buf = ShmFrameBuffer(shm_name, frame_shape, n_images=2, create=False)
 
-        # 核心逻辑修正：
-        # 1. 用户反馈：摄像头倒装，需要旋转 180 度 (flip-method=2)
-        # 2. 180 度旋转会交换左右。为了让旋转后的左图(f0)对应场景左侧，
-        #    我们需要把物理右(cam0)分配给 f0，旋转后它就变成了场景左。
-        def get_pipe(sid, w, h, f):
-            return (
-                f"nvarguscamerasrc sensor-id={sid} bufapi-version=1 ! "
-                f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
-                f"format=(string)NV12, framerate=(fraction){f}/1 ! "
-                f"nvvidconv flip-method=2 ! "  # 硬件旋转 180 度
-                f"video/x-raw, format=(string)BGRx ! "
-                f"videoconvert ! "
-                f"video/x-raw, format=(string)BGR ! "
-                f"appsink drop=1 max-buffers=1"
-            )
-
         # 尝试打开摄像头 (双目同步)
-        cap0 = cv2.VideoCapture(get_pipe(cfg.cam0, cfg.width, cfg.height, cfg.fps), cv2.CAP_GSTREAMER)
-        cap1 = cv2.VideoCapture(get_pipe(cfg.cam1, cfg.width, cfg.height, cfg.fps), cv2.CAP_GSTREAMER)
+        cap0 = cv2.VideoCapture(
+            _argus_pipeline(cfg.cam0, cfg.width, cfg.height, cfg.fps, cfg.flip_method), cv2.CAP_GSTREAMER
+        )
+        cap1 = cv2.VideoCapture(
+            _argus_pipeline(cfg.cam1, cfg.width, cfg.height, cfg.fps, cfg.flip_method), cv2.CAP_GSTREAMER
+        )
 
         while not stop_event.is_set():
             ok0, f0 = cap0.read(); ok1, f1 = cap1.read()
             if not ok0 or not ok1: continue
             
-            # GStreamer 已经通过 flip-method=2 完成了旋转
+            # 标准方式：方向在 GStreamer 完成，左右通过 swap_lr 处理
+            if cfg.swap_lr:
+                f0, f1 = f1, f0
 
             if calib_maps:
                 f0 = cv2.remap(f0, calib_maps["map1x"], calib_maps["map1y"], cv2.INTER_LINEAR)
@@ -442,6 +470,7 @@ def infer_worker(
         yolo_corruption_count = 0  # 🔥 检测到垃圾输出的次数
         yolo_current_model_path = None  # 🔥 当前使用的模型路径
         script_dir = Path(__file__).resolve().parent
+        names = {}  # 🔥 初始化类别名字典，防止未定义
 
         def _pick_fallback_model(primary_model: str) -> Optional[str]:
             primary = Path(primary_model)
@@ -457,10 +486,8 @@ def infer_worker(
         if not yolo_disabled:
             from ultralytics import YOLO
             gc.collect()
-            
             try:
                 selected_model = cfg.model
-                
                 # 🔥 强制使用.pt模型，避免TensorRT兼容性问题
                 if selected_model.lower().endswith(".engine"):
                     pt_model = str(Path(selected_model).with_suffix(".pt"))
@@ -469,21 +496,23 @@ def infer_worker(
                         selected_model = pt_model
                     else:
                         print(f"[InfW] ⚠️ 找不到.pt文件，将尝试使用.engine（可能不兼容）", flush=True)
-                
                 print(f"[InfW] 🚀 加载模型: {Path(selected_model).name}", flush=True)
                 yolo_model = YOLO(selected_model)
                 yolo_is_engine = selected_model.lower().endswith(".engine")
                 yolo_device = 0 if yolo_is_engine else "cuda"
                 yolo_half = yolo_is_engine
                 yolo_current_model_path = selected_model
-                
+                # 获取类别名
+                if hasattr(yolo_model, "names"):
+                    names = yolo_model.names
+                else:
+                    names = {}
                 # 检查是否为动态引擎
                 if yolo_is_engine and "-dyn" not in selected_model.lower():
                     yolo_fixed_size = cfg.seg_size  # 固定尺寸引擎
                     print(f"[InfW] ⚠️ 固定尺寸引擎，锁定输入尺寸为 {yolo_fixed_size}px", flush=True)
                 else:
                     print(f"[InfW] ✅ 模型支持动态分辨率切换", flush=True)
-
                 print(f"[InfW] ✅ YOLO就绪: {Path(selected_model).name}", flush=True)
                 gc.collect()
             except Exception as we:
@@ -502,12 +531,18 @@ def infer_worker(
                             torch.cuda.empty_cache()
                         gc.collect()
                         print(f"[InfW] YOLO 回退成功: model={Path(fallback_model).name} (延迟初始化)", flush=True)
+                        if hasattr(yolo_model, "names"):
+                            names = yolo_model.names
+                        else:
+                            names = {}
                     except Exception as fe:
                         print(f"[InfW] YOLO 回退失败, 禁用分割: {fe}", flush=True)
                         yolo_model = None
+                        names = {}
                 else:
                     print("[InfW] 无可用回退模型, 禁用分割", flush=True)
                     yolo_model = None
+                    names = {}
         else:
             print("[InfW] YOLO 已禁用", flush=True)
 
@@ -539,6 +574,9 @@ def infer_worker(
         last_dist_scale = 1.0
 
         print(f"[InfW] 开始推理循环 [当前方案: {DEPTH_SCHEMES[0]}]", flush=True)
+
+        _erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        _mask_open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
         while not stop_event.is_set():
             if not frame_ready.wait(timeout=0.1):
@@ -592,7 +630,7 @@ def infer_worker(
             vpi_l = _vpi.asimage(gray_l_s.astype(np.uint8))
             vpi_r = _vpi.asimage(gray_r_s.astype(np.uint8))
             with bk:
-                # swap_lr=False 时，rect_l 就是物理左，rect_r 就是物理右，无需交换
+                # rect_l / rect_r 已在 CameraWorker 中按 swap_lr 归一化
                 vpi_out = _vpi.stereodisp(vpi_l, vpi_r, maxdisp=max_disp, window=stereo_window, stream=vpi_stream)
             vpi_stream.sync()
             disp = vpi_out.cpu().astype(np.float32) / 32.0
@@ -610,10 +648,19 @@ def infer_worker(
                 disp *= ds
             disp = np.clip(disp, 0, max_disp * max(1, ds))
 
+            # 视差后处理: 纹理约束 + speckle 剔除
+            disp, reliable_disp_mask = postprocess_disparity(
+                disp,
+                gray_l,
+                min_disp=1.0,
+                texture_grad_thresh=8.0,
+                min_speckle_area=80,
+            )
+
             # 🔥 使用选择的方案计算深度，应用距离校正系数
             max_disp_val = float(max_disp * max(1, ds))
             depth_map = compute_depth(disp, bf, max_disp_val, cur_scheme, cur_dist_scale)
-            valid = (depth_map > 0.01) & (depth_map < 30.0)
+            valid = (depth_map > 0.01) & (depth_map < 30.0) & reliable_disp_mask
 
             # YOLO 分割
             instances = []
@@ -693,8 +740,9 @@ def infer_worker(
                                 if len(seg_norm) == 0: continue
                                 pts = (seg_norm * np.array([frame_w, frame_h])).astype(np.int32).reshape((-1, 1, 2))
                                 
-                                mask_full = np.zeros((frame_h, frame_w), dtype=bool)
-                                cv2.fillPoly(mask_full.view(np.uint8), [pts], 1)
+                                mask_full_u8 = np.zeros((frame_h, frame_w), dtype=np.uint8)
+                                cv2.fillPoly(mask_full_u8, [pts], (255,))
+                                mask_full = mask_full_u8 > 0
                                 
                                 box = boxes_data[i]
                                 x1, y1, x2, y2 = [int(v) for v in box[:4]]
@@ -737,12 +785,10 @@ def infer_worker(
             overlay = yolo_input.copy()
             seg_depth_vis = yolo_input.copy()
 
-            # 形态学腐蚀核（用于剥离边缘飞点）
-            _erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-
             for inst in instances:
                 mask_u8 = inst["mask"].astype(np.uint8) * 255
-                mask_u8 = cv2.blur(mask_u8, (3, 3))
+                mask_u8 = cv2.medianBlur(mask_u8, 5)
+                mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, _mask_open_kernel)
                 mask = mask_u8 > 127
                 mask_u8 = mask.astype(np.uint8) * 255
                 cls_name = inst["class"]
@@ -770,7 +816,9 @@ def infer_worker(
 
                 # Step 2: 初步过滤 —— 提取有效深度，排除死点和异常值
                 depths_raw = depth_map[eroded_mask]
+                reliable_in_mask = reliable_disp_mask[eroded_mask]
                 valid_filter = (
+                    reliable_in_mask &
                     (depths_raw > 0.2) &
                     (depths_raw < 8.0) &
                     (depths_raw != 0.0) &
@@ -808,10 +856,11 @@ def infer_worker(
                     n_after_iqr = 0
 
                 x1, y1, x2, y2 = box
-                print(f"[DEBUG-DEPTH] [方案{cur_scheme}] {cls_name} BBox:[{x1},{y1},{x2},{y2}] "
-                      f"Mask:{mask_area}px Eroded:{eroded_area}px "
-                      f"有效深度(IQR前):{n_before_iqr} (IQR后):{n_after_iqr} "
-                      f"视差中位数:{disp_median:.2f} → 距离:{median_depth:.2f}m", flush=True)
+                if perf_count < 5 or (perf_count % 30 == 0):
+                    print(f"[DEBUG-DEPTH] [方案{cur_scheme}] {cls_name} BBox:[{x1},{y1},{x2},{y2}] "
+                          f"Mask:{mask_area}px Eroded:{eroded_area}px "
+                          f"有效深度(IQR前):{n_before_iqr} (IQR后):{n_after_iqr} "
+                          f"视差中位数:{disp_median:.2f} → 距离:{median_depth:.2f}m", flush=True)
                 
                 color = depth_to_color(median_depth) if median_depth > 0 else (128, 128, 128)
 
@@ -835,7 +884,7 @@ def infer_worker(
                 seg_depth_vis[mask_u8 > 0] = color
 
             # 视差可视化
-            disp_normed = np.clip(disp / 128.0, 0, 1)
+            disp_normed = np.clip(disp / max(max_disp_val, 1.0), 0, 1)
             disp_u8 = (disp_normed * 255).astype(np.uint8)
             depth_color = cv2.applyColorMap(disp_u8, cv2.COLORMAP_JET)
             if not np.all(valid):
@@ -1215,9 +1264,8 @@ def parse_args() -> AppConfig:
     cam.add_argument("--width", type=int, default=1280)
     cam.add_argument("--height", type=int, default=720)
     cam.add_argument("--fps", type=int, default=30)
-    cam.add_argument("--rotate0", type=int, default=0)
-    cam.add_argument("--rotate1", type=int, default=0)
-    cam.add_argument("--swap-lr", action="store_true", default=False)
+    cam.add_argument("--flip-method", type=int, default=2)
+    cam.add_argument("--swap-lr", action="store_true", default=True)
     cam.add_argument("--no-swap-lr", dest="swap_lr", action="store_false")
 
     cal = p.add_argument_group("标定")
@@ -1238,14 +1286,14 @@ def parse_args() -> AppConfig:
 
     srv = p.add_argument_group("服务器")
     srv.add_argument("--host", default="0.0.0.0")
-    srv.add_argument("--port", type=int, default=8080)
+    srv.add_argument("--port", type=int, default=8088)
     srv.add_argument("--jpeg-quality", type=int, default=70)
     srv.add_argument("--preview-width", type=int, default=640)
 
     a = p.parse_args()
     return AppConfig(
         cam0=a.cam0, cam1=a.cam1, width=a.width, height=a.height, fps=a.fps,
-        rotate0=a.rotate0, rotate1=a.rotate1, swap_lr=a.swap_lr,
+        flip_method=a.flip_method, swap_lr=a.swap_lr,
         calib_path=a.calib, no_rectify=a.no_rectify,
         max_disparity=a.max_disparity, vpi_backend=a.vpi_backend, downscale=a.downscale,
         model=a.model, conf=a.conf, seg_size=a.seg_size, max_det=a.max_det,

@@ -27,12 +27,15 @@ def run_cmd(command: list[str]) -> Tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
-def build_argus_pipeline(sensor_id: int, width: int, height: int, fps: int) -> str:
+def build_argus_pipeline(sensor_id: int, width: int, height: int, fps: int, flip_method: int) -> str:
+    fm = int(flip_method)
+    if fm not in (0, 1, 2, 3, 4, 5, 6, 7):
+        fm = 2
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){width}, height=(int){height}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        "nvvidconv ! video/x-raw, format=(string)BGRx ! "
+        f"nvvidconv flip-method={fm} ! video/x-raw, format=(string)BGRx ! "
         "videoconvert ! video/x-raw, format=(string)BGR ! "
         "appsink drop=1 max-buffers=1 sync=false"
     )
@@ -46,10 +49,10 @@ def build_v4l2_pipeline(device: str, width: int, height: int, fps: int) -> str:
     )
 
 
-def open_camera(source: str, camera: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
+def open_camera(source: str, camera: str, width: int, height: int, fps: int, flip_method: int) -> cv2.VideoCapture:
     if source == "argus":
         sensor_id = int(camera)
-        pipeline = build_argus_pipeline(sensor_id, width, height, fps)
+        pipeline = build_argus_pipeline(sensor_id, width, height, fps, flip_method)
         cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     else:
         pipeline = build_v4l2_pipeline(camera, width, height, fps)
@@ -60,9 +63,9 @@ def open_camera(source: str, camera: str, width: int, height: int, fps: int) -> 
     return cap
 
 
-def open_camera_with_fallback(source: str, camera: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
+def open_camera_with_fallback(source: str, camera: str, width: int, height: int, fps: int, flip_method: int) -> cv2.VideoCapture:
     if source != "argus":
-        return open_camera(source, camera, width, height, fps)
+        return open_camera(source, camera, width, height, fps, flip_method)
 
     fallback_profiles = [
         (width, height, fps),
@@ -81,7 +84,7 @@ def open_camera_with_fallback(source: str, camera: str, width: int, height: int,
         seen.add(profile)
         try:
             print(f"[INFO] 尝试打开相机 {camera}: {w}x{h}@{f}")
-            return open_camera(source, camera, w, h, f)
+            return open_camera(source, camera, w, h, f, flip_method)
         except Exception as exc:
             last_exc = exc
             print(f"[WARN] 相机 {camera} 打开失败: {exc}")
@@ -240,6 +243,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1640)
     parser.add_argument("--height", type=int, default=1232)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--flip-method", type=int, default=2)
+    parser.add_argument("--swap-lr", action="store_true", default=True)
+    parser.add_argument("--no-swap-lr", dest="swap_lr", action="store_false")
     parser.add_argument("--view-width", type=int, default=960, help="单路预览窗口宽")
     parser.add_argument("--view-height", type=int, default=720, help="单路预览窗口高")
     parser.add_argument("--no-gui", action="store_true", help="无图形界面模式，仅输出日志")
@@ -254,9 +260,9 @@ def main() -> int:
         print("[WARN] 未检测到 DISPLAY，可能无法弹出窗口。可在桌面会话运行，或加 --no-gui。")
 
     try:
-        cap0 = open_camera_with_fallback(args.source, args.cam0, args.width, args.height, args.fps)
+        cap0 = open_camera_with_fallback(args.source, args.cam0, args.width, args.height, args.fps, args.flip_method)
         time.sleep(0.35)
-        cap1 = open_camera_with_fallback(args.source, args.cam1, args.width, args.height, args.fps)
+        cap1 = open_camera_with_fallback(args.source, args.cam1, args.width, args.height, args.fps, args.flip_method)
     except Exception as exc:
         print(f"[ERR] {exc}")
         print("[HINT] 可尝试: 1) sudo systemctl restart nvargus-daemon 2) 降分辨率 3) 关闭占用相机进程")
@@ -294,6 +300,12 @@ def main() -> int:
         if not ok0 or not ok1:
             print("[WARN] 读取帧失败，退出。")
             break
+
+        if args.source != "argus":
+            frame0 = cv2.rotate(frame0, cv2.ROTATE_180)
+            frame1 = cv2.rotate(frame1, cv2.ROTATE_180)
+        if args.swap_lr:
+            frame0, frame1 = frame1, frame0
 
         score0 = focus_score(frame0)
         score1 = focus_score(frame1)

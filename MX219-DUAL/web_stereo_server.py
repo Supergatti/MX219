@@ -19,16 +19,21 @@ class ServerConfig:
     width: int
     height: int
     fps: int
+    flip_method: int
+    swap_lr: bool
     jpeg_quality: int
     overlay: bool
 
 
-def build_argus_pipeline(sensor_id: int, width: int, height: int, fps: int) -> str:
+def build_argus_pipeline(sensor_id: int, width: int, height: int, fps: int, flip_method: int) -> str:
+    fm = int(flip_method)
+    if fm not in (0, 1, 2, 3, 4, 5, 6, 7):
+        fm = 2
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){width}, height=(int){height}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        "nvvidconv ! video/x-raw, format=(string)BGRx ! "
+        f"nvvidconv flip-method={fm} ! video/x-raw, format=(string)BGRx ! "
         "videoconvert ! video/x-raw, format=(string)BGR ! "
         "appsink drop=1 max-buffers=1 sync=false"
     )
@@ -43,9 +48,9 @@ def build_v4l2_pipeline(device: str, width: int, height: int, fps: int) -> str:
     )
 
 
-def open_camera(source: str, camera: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
+def open_camera(source: str, camera: str, width: int, height: int, fps: int, flip_method: int) -> cv2.VideoCapture:
     if source == "argus":
-        pipeline = build_argus_pipeline(int(camera), width, height, fps)
+        pipeline = build_argus_pipeline(int(camera), width, height, fps, flip_method)
     else:
         pipeline = build_v4l2_pipeline(camera, width, height, fps)
 
@@ -55,9 +60,9 @@ def open_camera(source: str, camera: str, width: int, height: int, fps: int) -> 
     return cap
 
 
-def open_camera_with_fallback(source: str, camera: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
+def open_camera_with_fallback(source: str, camera: str, width: int, height: int, fps: int, flip_method: int) -> cv2.VideoCapture:
     if source != "argus":
-        return open_camera(source, camera, width, height, fps)
+        return open_camera(source, camera, width, height, fps, flip_method)
 
     profiles = [
         (width, height, fps),
@@ -75,7 +80,7 @@ def open_camera_with_fallback(source: str, camera: str, width: int, height: int,
         seen.add(profile)
         try:
             print(f"[INFO] 尝试打开相机 {camera}: {w}x{h}@{f}")
-            return open_camera(source, camera, w, h, f)
+            return open_camera(source, camera, w, h, f, flip_method)
         except Exception as exc:
             last_error = exc
             print(f"[WARN] 相机 {camera} 打开失败: {exc}")
@@ -149,11 +154,11 @@ class FrameHub:
 
     def start(self) -> None:
         self._cap0 = open_camera_with_fallback(
-            self.config.source, self.config.cam0, self.config.width, self.config.height, self.config.fps
+            self.config.source, self.config.cam0, self.config.width, self.config.height, self.config.fps, self.config.flip_method
         )
         time.sleep(0.3)
         self._cap1 = open_camera_with_fallback(
-            self.config.source, self.config.cam1, self.config.width, self.config.height, self.config.fps
+            self.config.source, self.config.cam1, self.config.width, self.config.height, self.config.fps, self.config.flip_method
         )
         self._running = True
         threading.Thread(target=self._capture_loop, daemon=True).start()
@@ -173,6 +178,12 @@ class FrameHub:
             if not ok0 or not ok1:
                 time.sleep(0.02)
                 continue
+
+            if self.config.source != "argus":
+                frame0 = cv2.rotate(frame0, cv2.ROTATE_180)
+                frame1 = cv2.rotate(frame1, cv2.ROTATE_180)
+            if self.config.swap_lr:
+                frame0, frame1 = frame1, frame0
 
             if self.config.overlay:
                 score0 = focus_score(frame0)
@@ -287,6 +298,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1640)
     parser.add_argument("--height", type=int, default=1232)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--flip-method", type=int, default=2)
+    parser.add_argument("--swap-lr", action="store_true", default=True)
+    parser.add_argument("--no-swap-lr", dest="swap_lr", action="store_false")
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--no-overlay", action="store_true", help="关闭清晰度叠加")
     return parser.parse_args()
@@ -301,6 +315,8 @@ def main() -> int:
         width=args.width,
         height=args.height,
         fps=args.fps,
+        flip_method=args.flip_method,
+        swap_lr=args.swap_lr,
         jpeg_quality=max(30, min(95, args.jpeg_quality)),
         overlay=not args.no_overlay,
     )

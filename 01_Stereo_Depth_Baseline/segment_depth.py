@@ -78,8 +78,8 @@ class AppConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
-    # 物理倒置：180 度旋转
-    rotate: int = 180
+    # 标准方式：在 GStreamer 中做 180 度旋转
+    flip_method: int = 2
     swap_lr: bool = True
     calib_path: str = str(Path(__file__).resolve().parent / "calib_data" / "stereo_calib.npz")
     no_rectify: bool = False
@@ -202,13 +202,15 @@ ROTATE_CODE = {
     270: cv2.ROTATE_90_COUNTERCLOCKWISE,
 }
 
-def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int) -> str:
-    # 强制 180 度旋转 (flip-method=2)
+def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int, flip_method: int) -> str:
+    fm = int(flip_method)
+    if fm not in (0, 1, 2, 3, 4, 5, 6, 7):
+        fm = 2
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        f"nvvidconv flip-method=2 ! video/x-raw, format=(string)BGRx ! "
+        f"nvvidconv flip-method={fm} ! video/x-raw, format=(string)BGRx ! "
         f"videoconvert ! video/x-raw, format=(string)BGR ! "
         f"appsink drop=1 max-buffers=1 sync=false"
     )
@@ -272,11 +274,20 @@ def camera_worker(
         # 打开 SharedMemory (attach, 不创建)
         shm_buf = ShmFrameBuffer(shm_name, frame_shape, n_images=2, create=False)
 
-        # 核心逻辑修正：
-        # 1. 用户反馈：遮住物理右侧，rawleft被遮。说明 cam0 是物理右。
-        # 2. 摄像头倒装，需要旋转 180 度。
-        # 3. 180 度旋转会交换左右。为了让旋转后的左图(f0)对应场景左侧，
-        #    我们需要把物理右(cam0)分配给 f0，旋转后它就变成了场景左。
+        map1x = map1y = map2x = map2y = None
+        if calib_maps:
+            map1x = calib_maps.get("map1x")
+            map1y = calib_maps.get("map1y")
+            map2x = calib_maps.get("map2x")
+            map2y = calib_maps.get("map2y")
+        do_rectify = (
+            (not cfg.no_rectify)
+            and map1x is not None and map1y is not None
+            and map2x is not None and map2y is not None
+        )
+        debug_saved = False
+        frame_idx = 0
+
         profiles = [
             (cfg.width, cfg.height, cfg.fps),
             (1280, 720, min(cfg.fps, 30)),
@@ -285,18 +296,36 @@ def camera_worker(
         opened = False
         for pw, ph, pf in profiles:
             try:
-                cap_l = cv2.VideoCapture(_argus_pipeline(cfg.cam0, pw, ph, pf), cv2.CAP_GSTREAMER)
+                cap0 = cv2.VideoCapture(
+                    _argus_pipeline(cfg.cam0, pw, ph, pf, cfg.flip_method), cv2.CAP_GSTREAMER
+                )
                 time.sleep(0.2)
-                cap_r = cv2.VideoCapture(_argus_pipeline(cfg.cam1, pw, ph, pf), cv2.CAP_GSTREAMER)
-                if cap_l.isOpened() and cap_r.isOpened():
-                    opened = True; break
-            except Exception: pass
+                cap1 = cv2.VideoCapture(
+                    _argus_pipeline(cfg.cam1, pw, ph, pf, cfg.flip_method), cv2.CAP_GSTREAMER
+                )
+                if cap0.isOpened() and cap1.isOpened():
+                    opened = True
+                    break
+                if cap0:
+                    cap0.release()
+                if cap1:
+                    cap1.release()
+                cap0 = cap1 = None
+            except Exception:
+                pass
+
+        if not opened or cap0 is None or cap1 is None:
+            raise RuntimeError("无法打开双目相机")
 
         while not stop_event.is_set():
-            ok0, f0 = cap_l.read(); ok1, f1 = cap_r.read()
-            if not ok0 or not ok1: continue
-            
-            # GStreamer 已经通过 flip-method=2 完成了旋转
+            ok0, f0 = cap0.read()
+            ok1, f1 = cap1.read()
+            if not ok0 or not ok1:
+                continue
+
+            # 标准方式：方向在 GStreamer 完成，左右通过 swap_lr 处理
+            if cfg.swap_lr:
+                f0, f1 = f1, f0
 
             # 畸变校正
             if do_rectify and map1x is not None and map1y is not None and map2x is not None and map2y is not None:
@@ -1019,8 +1048,7 @@ def parse_args() -> AppConfig:
     cam.add_argument("--width", type=int, default=1280)
     cam.add_argument("--height", type=int, default=720)
     cam.add_argument("--fps", type=int, default=30)
-    cam.add_argument("--rotate0", type=int, default=180)
-    cam.add_argument("--rotate1", type=int, default=180)
+    cam.add_argument("--flip-method", type=int, default=2)
     cam.add_argument("--swap-lr", action="store_true", default=True)
     cam.add_argument("--no-swap-lr", dest="swap_lr", action="store_false")
 
@@ -1048,7 +1076,7 @@ def parse_args() -> AppConfig:
     a = p.parse_args()
     return AppConfig(
         cam0=a.cam0, cam1=a.cam1, width=a.width, height=a.height, fps=a.fps,
-        rotate0=a.rotate0, rotate1=a.rotate1, swap_lr=a.swap_lr,
+        flip_method=a.flip_method, swap_lr=a.swap_lr,
         calib_path=a.calib, no_rectify=a.no_rectify,
         max_disparity=a.max_disparity, vpi_backend=a.vpi_backend, downscale=a.downscale,
         model=a.model, conf=a.conf, seg_size=a.seg_size, max_det=a.max_det,

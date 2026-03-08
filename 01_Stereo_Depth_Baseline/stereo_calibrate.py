@@ -57,12 +57,10 @@ class Config:
     height: int = 720
     fps: int = 30
     # 根据用户描述：面对z轴，y轴指向地面(Down)，x轴水平向左(Left)。
-    # 物理倒置 + X向左 = 垂直翻转 (Vertical Flip)
-    # 我们已经在 pipeline 中强制 flip-method=2 (180度旋转)
+    # 默认在 pipeline 中使用 flip-method=2 (180度旋转)
     flip_method: int = 2
-    # 旋转180度后，物理右(Cam0)变为画面左，物理左(Cam1)变为画面右
-    # 所以 Cam0=Left, Cam1=Right，不需要交换
-    swap_lr: bool = False
+    # 默认启用左右交换，确保输出左右与物理左右一致
+    swap_lr: bool = True
     # 标定板
     board_type: str = "chessboard"     # "chessboard" 或 "charuco"
     board_cols: int = 8                # 棋盘格列数 / ChArUco squaresX
@@ -80,26 +78,30 @@ class Config:
     output_dir: str = "calib_data"
     # 服务器
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 8095
+
 
 
 # ═══════════════════════════════════════════════════════════════
 # GStreamer / 相机
 # ═══════════════════════════════════════════════════════════════
-def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int) -> str:
-    # 强制 180 度旋转 (flip-method=2)
+def _argus_pipeline(sensor_id: int, w: int, h: int, fps: int, flip_method: int) -> str:
+    # 默认推荐 flip-method=2 (180 度)，可通过参数覆盖
+    fm = int(flip_method)
+    if fm not in (0, 1, 2, 3, 4, 5, 6, 7):
+        fm = 2
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} bufapi-version=true ! "
         f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
         f"format=(string)NV12, framerate=(fraction){fps}/1 ! "
-        f"nvvidconv flip-method=2 ! video/x-raw, format=(string)BGRx ! "
+        f"nvvidconv flip-method={fm} ! video/x-raw, format=(string)BGRx ! "
         f"videoconvert ! video/x-raw, format=(string)BGR ! "
         f"appsink drop=1 max-buffers=1 sync=false"
     )
 
 
-def _open_cam(sensor_id: int, w: int, h: int, fps: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(_argus_pipeline(sensor_id, w, h, fps), cv2.CAP_GSTREAMER)
+def _open_cam(sensor_id: int, w: int, h: int, fps: int, flip_method: int) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(_argus_pipeline(sensor_id, w, h, fps, flip_method), cv2.CAP_GSTREAMER)
     if not cap.isOpened():
         raise RuntimeError(f"无法打开相机 sensor-id={sensor_id}")
     for _ in range(15):
@@ -110,7 +112,7 @@ def _open_cam(sensor_id: int, w: int, h: int, fps: int) -> cv2.VideoCapture:
     return cap
 
 
-def _open_stereo(cam0: int, cam1: int, w: int, h: int, fps: int
+def _open_stereo(cam0: int, cam1: int, w: int, h: int, fps: int, flip_method: int
                  ) -> Tuple[cv2.VideoCapture, cv2.VideoCapture]:
     profiles = [(w, h, fps), (1280, 720, min(fps, 30)), (640, 480, min(fps, 30))]
     seen = set()
@@ -120,9 +122,9 @@ def _open_stereo(cam0: int, cam1: int, w: int, h: int, fps: int
         seen.add((pw, ph, pf))
         try:
             print(f"[CAM] 尝试 {pw}x{ph}@{pf} ...")
-            c0 = _open_cam(cam0, pw, ph, pf)
+            c0 = _open_cam(cam0, pw, ph, pf, flip_method)
             time.sleep(0.2)
-            c1 = _open_cam(cam1, pw, ph, pf)
+            c1 = _open_cam(cam1, pw, ph, pf, flip_method)
             print(f"[CAM] 双目打开成功: {pw}x{ph}@{pf}")
             return c0, c1
         except Exception as e:
@@ -270,7 +272,7 @@ class CaptureSession:
 
         self._cap0, self._cap1 = _open_stereo(
             self.cfg.cam0, self.cfg.cam1,
-            self.cfg.width, self.cfg.height, self.cfg.fps,
+            self.cfg.width, self.cfg.height, self.cfg.fps, self.cfg.flip_method,
         )
         self._running = True
         threading.Thread(target=self._loop, daemon=True).start()
@@ -291,13 +293,10 @@ class CaptureSession:
                 time.sleep(0.01)
                 continue
 
+            # 方向已在 GStreamer pipeline 中通过 flip-method 完成
+            # 左右交换单独处理，避免与方向修正耦合
             if self.cfg.swap_lr:
-                # cam1 (cfg.cam1) -> Left (frame0), cam0 (cfg.cam0) -> Right (frame1)
-                pass # 已在 _open_stereo 分配正确
-            
-            # 🔥 统一方向：垂直翻转 (Y下X左)
-            frame0 = cv2.flip(frame0, 0)
-            frame1 = cv2.flip(frame1, 0)
+                frame0, frame1 = frame1, frame0
 
             gray_l = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
             gray_r = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
@@ -872,7 +871,7 @@ def parse_args() -> Tuple[str, Config]:
     cam.add_argument("--width", type=int, default=1280)
     cam.add_argument("--height", type=int, default=720)
     cam.add_argument("--fps", type=int, default=30)
-    cam.add_argument("--flip-method", type=int, default=0, help="0=Vertical, 1=Horizontal, -1=Both")
+    cam.add_argument("--flip-method", type=int, default=2, help="GStreamer nvvidconv flip-method，推荐 2（180度）")
     cam.add_argument("--swap-lr", action="store_true", default=True)
     cam.add_argument("--no-swap-lr", dest="swap_lr", action="store_false")
 
@@ -902,7 +901,7 @@ def parse_args() -> Tuple[str, Config]:
     out = p.add_argument_group("输出")
     out.add_argument("--output-dir", default="calib_data")
     out.add_argument("--host", default="0.0.0.0")
-    out.add_argument("--port", type=int, default=8080)
+    out.add_argument("--port", type=int, default=8095)
 
     a = p.parse_args()
     cfg = Config(
