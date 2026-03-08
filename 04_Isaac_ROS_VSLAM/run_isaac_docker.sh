@@ -45,11 +45,40 @@ docker run -it --rm \
   -e ROS_DOMAIN_ID=99 \
   -e EGL_PLATFORM=surfaceless \
   -e LIBGL_ALWAYS_SOFTWARE=0 \
+  -e WEB_MONITOR_REFRESH_MS="${WEB_MONITOR_REFRESH_MS:-33}" \
+  -e WEB_MONITOR_MAX_FPS="${WEB_MONITOR_MAX_FPS:-30.0}" \
+  -e WEB_MONITOR_SCALE="${WEB_MONITOR_SCALE:-0.5}" \
+  -e WEB_MONITOR_JPEG_QUALITY="${WEB_MONITOR_JPEG_QUALITY:-60}" \
+  -e WEB_MONITOR_DISPARITY_SCALE="${WEB_MONITOR_DISPARITY_SCALE:-0.4}" \
+  -e WEB_MONITOR_ENABLE_DISPARITY="${WEB_MONITOR_ENABLE_DISPARITY:-0}" \
+  -e WEB_MONITOR_ENABLE_FEATURES="${WEB_MONITOR_ENABLE_FEATURES:-0}" \
+  -e ARGUS_LEFT_CAMERA_ID="${ARGUS_LEFT_CAMERA_ID:-0}" \
+  -e ARGUS_RIGHT_CAMERA_ID="${ARGUS_RIGHT_CAMERA_ID:-1}" \
+  -e ARGUS_LEFT_MODULE_ID="${ARGUS_LEFT_MODULE_ID:-0}" \
+  -e ARGUS_RIGHT_MODULE_ID="${ARGUS_RIGHT_MODULE_ID:-1}" \
+  -e ARGUS_MODULE_ID="${ARGUS_MODULE_ID:--1}" \
+  -e ARGUS_MODE="${ARGUS_MODE:-4}" \
+  -e ARGUS_FSYNC_TYPE="${ARGUS_FSYNC_TYPE:-0}" \
+  -e ARGUS_FRAMERATE="${ARGUS_FRAMERATE:-30.0}" \
+  -e ARGUS_SWAP_LR="${ARGUS_SWAP_LR:-0}" \
+  -e ARGUS_LEFT_CAMERA_INFO_URL="${ARGUS_LEFT_CAMERA_INFO_URL:-file:///workspace/src/calib/left.yaml}" \
+  -e ARGUS_RIGHT_CAMERA_INFO_URL="${ARGUS_RIGHT_CAMERA_INFO_URL:-file:///workspace/src/calib/right.yaml}" \
+  -e ENABLE_WEB_MONITOR="${ENABLE_WEB_MONITOR:-1}" \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v "${SCRIPT_DIR}:/workspace/src" \
   -w /workspace/src \
   "${IMAGE}" \
-  -c "source /opt/ros/humble/setup.bash && \
+  -c "python3 - <<'PY' || true
+import socket
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.connect('/tmp/argus_restart_socket')
+    s.send(b'RESTART_SERVICE')
+    s.close()
+except Exception:
+    pass
+PY
+      source /opt/ros/humble/setup.bash && \
       echo '[INFO] Starting VSLAM launch...' && \
       ros2 launch /workspace/src/isaac_vslam_run.launch.py || \
       (echo '[ERROR] Launch failed, dropping to bash for debug'; exec bash)"
